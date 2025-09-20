@@ -2,7 +2,7 @@ import os
 import logging
 from pathlib import Path
 from dotenv import load_dotenv
-from telegram import Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, FSInputFile
+from telegram import Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, FSInputFile, InputMediaPhoto
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters, CallbackQueryHandler
 
 # Загрузить переменные окружения из .env
@@ -189,18 +189,41 @@ async def on_category_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         chosen_titles = ", ".join(CATEGORY_DISPLAY[c] for c in CATEGORY_ORDER if c in selected)
         try:
             await query.message.edit_text(
-                f"Вы выбрали: {chosen_titles}\n\nТеперь выберите примеры слайдов по категориям:")
+                f"Вы выбрали: {chosen_titles}\n\nПоказываю примеры слайдов по категориям:")
         except Exception:
             pass
 
-    # Отправить по сообщению на каждую выбранную категорию
+    # Отправить медиагруппы с изображениями для каждой выбранной категории
     for code in CATEGORY_ORDER:
         if code not in selected:
             continue
         title = CATEGORY_DISPLAY[code]
-        total = _slides_count_for_category(code)
-        prompt = f"{title}: выберите пример (доступно {total} вариант(а/ов))"
-        await query.message.reply_text(prompt, reply_markup=_build_slides_keyboard(code))
+        limit = _slides_count_for_category(code)
+        paths = _list_slide_paths(code, limit)
+        if not paths:
+            await query.message.reply_text(f"{title}: не нашлось файлов в папке.")
+            continue
+        # Если файлов несколько — отправим медиагруппу, иначе одиночное фото
+        if len(paths) > 1:
+            medias: list[InputMediaPhoto] = [InputMediaPhoto(media=FSInputFile(str(p))) for p in paths]
+            # Подпись только на первом
+            medias[0].caption = f"{title}: примеры"
+            messages = await query.message.reply_media_group(media=medias)
+            # Кэшируем file_id
+            cache: dict[str, str] = context.application.bot_data.setdefault("file_id_cache", {})
+            for p, m in zip(paths, messages):
+                if m.photo:
+                    cache[str(p)] = m.photo[-1].file_id
+        else:
+            p = paths[0]
+            cache: dict[str, str] = context.application.bot_data.setdefault("file_id_cache", {})
+            key = str(p)
+            if key in cache:
+                await query.message.reply_photo(photo=cache[key], caption=f"{title}: пример")
+            else:
+                m = await query.message.reply_photo(photo=FSInputFile(key), caption=f"{title}: пример")
+                if m.photo:
+                    cache[key] = m.photo[-1].file_id
 
 
 async def on_slide_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -209,34 +232,12 @@ async def on_slide_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if not query or not query.data:
         return
     await query.answer()
-    _, code, idx = query.data.split(":", maxsplit=2)
-    title = CATEGORY_DISPLAY.get(code, code)
-    # Попробуем найти файл слайда и отправить изображение
-    path = _resolve_slide_path(code, int(idx))
-    if path:
-        cache: dict[str, str] = context.application.bot_data.setdefault("file_id_cache", {})  # path->file_id
-        cache_key = str(path)
-        try:
-            if cache_key in cache:
-                # Отправляем по закешированному file_id
-                await query.message.reply_photo(photo=cache[cache_key], caption=f"{title}: слайд {idx}")
-            else:
-                message = await query.message.reply_photo(photo=FSInputFile(cache_key), caption=f"{title}: слайд {idx}")
-                if message and message.photo:
-                    cache[cache_key] = message.photo[-1].file_id
-        except Exception as exc:
-            logging.error("Не удалось отправить слайд %s: %s", cache_key, exc)
-            await query.message.reply_text(f"Не удалось отправить файл для {title} (слайд {idx}).")
-    else:
-        await query.message.reply_text(f"Файл для {title} (слайд {idx}) не найден в папке.")
-
-    # Обновляем текст исходного сообщения о выборе, если возможно
-    text = f"Вы выбрали {title} → слайд {idx}."
-    if query.message:
-        try:
-            await query.message.edit_text(text)
-        except Exception:
-            pass
+    # Текущий флоу больше не использует кнопки слайдов; просто очищаем уведомление.
+    try:
+        if query.message:
+            await query.message.delete()
+    except Exception:
+        pass
 
 
 SUPPORTED_IMAGE_EXTS: tuple[str, ...] = (".jpg", ".jpeg", ".png", ".webp")
@@ -266,6 +267,34 @@ def _resolve_slide_path(code: str, idx: int) -> Path | None:
     if 1 <= idx <= len(files):
         return files[idx - 1]
     return None
+
+
+def _list_slide_paths(code: str, limit: int) -> list[Path]:
+    """Возвращает список путей к слайдам для категории, максимум limit.
+
+    Предпочтение — именам `<code>_1.ext ... <code>_N.ext`. Если некоторых нет,
+    добираем алфавитной выборкой поддерживаемых изображений.
+    """
+    result: list[Path] = []
+    base = _slides_dir_for(code)
+    if not base.exists():
+        return result
+    # Сначала по шаблону
+    for i in range(1, limit + 1):
+        p = _resolve_slide_path(code, i)
+        if p and p.exists():
+            result.append(p)
+    if len(result) >= limit:
+        return result[:limit]
+    # Добор алфавитными файлами
+    files = [p for p in base.iterdir() if p.is_file() and p.suffix.lower() in SUPPORTED_IMAGE_EXTS]
+    files.sort(key=lambda p: p.name.lower())
+    for p in files:
+        if p not in result:
+            result.append(p)
+            if len(result) >= limit:
+                break
+    return result[:limit]
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Принимает фото и отправляет его обратно тем же сообщением."""
